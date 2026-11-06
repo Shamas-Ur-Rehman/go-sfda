@@ -13,3 +13,5 @@ sfda.checkpoint.json
 coverage.txt
 coverage.html
 examples/smoke-test/go-sfda-smoke-test*
+config.bat
+node_modules
