@@ -27,10 +27,6 @@ implementing a small sink interface.
 go get github.com/Shamas-Ur-Rehman/go-sfda
 ```
 
-The repository currently keeps the Go module in the `go-sfda/` subdirectory.
-If the module is moved or published under a different repository, update the
-module path and these imports accordingly.
-
 ## Fetch records
 
 ```go
