@@ -37,6 +37,7 @@ type Options struct {
 	ListPath        string
 	HTTPClient      *http.Client
 	MaxWorkers      int
+	MaxPages        int
 	RequestInterval time.Duration
 	RequestTimeout  time.Duration
 	MaxRetries      int
@@ -49,6 +50,7 @@ type Scraper struct {
 	listPath        string
 	httpClient      *http.Client
 	maxWorkers      int
+	maxPages        int
 	requestInterval time.Duration
 	maxRetries      int
 	backoff         time.Duration
@@ -77,6 +79,9 @@ func NewScraper(options Options) (*Scraper, error) {
 	workers := options.MaxWorkers
 	if workers <= 0 {
 		workers = defaultWorkers
+	}
+	if options.MaxPages < 0 {
+		return nil, fmt.Errorf("maximum pages cannot be negative")
 	}
 	requestInterval := options.RequestInterval
 	if requestInterval < 0 {
@@ -110,6 +115,7 @@ func NewScraper(options Options) (*Scraper, error) {
 		listPath:        listPath,
 		httpClient:      client,
 		maxWorkers:      workers,
+		maxPages:        options.MaxPages,
 		requestInterval: requestInterval,
 		maxRetries:      retries,
 		backoff:         backoff,
@@ -117,8 +123,9 @@ func NewScraper(options Options) (*Scraper, error) {
 	}, nil
 }
 
-// FetchAll scrapes all pages, applies optional filters, and returns matching
-// records in the same order as the website.
+// FetchAll scrapes the configured pages, applies optional filters, and returns
+// matching records in the same order as the website. By default all pages are
+// scraped; Options.MaxPages can limit a run.
 func (s *Scraper) FetchAll(ctx context.Context, filters ...model.Filter) ([]model.Drug, error) {
 	var records []model.Drug
 	sink := storage.SinkFunc(func(_ context.Context, drug model.Drug) error {
@@ -150,6 +157,9 @@ func (s *Scraper) Scrape(ctx context.Context, sink storage.Sink, filters ...mode
 		return fmt.Errorf("parse SFDA list page 0: %w", err)
 	}
 	totalPages := list.TotalPages
+	if s.maxPages > 0 && s.maxPages < totalPages {
+		totalPages = s.maxPages
+	}
 
 	for page := 0; page < totalPages; page++ {
 		if err := ctx.Err(); err != nil {

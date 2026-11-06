@@ -107,6 +107,59 @@ func TestParseListPageRejectsUnexpectedHTML(t *testing.T) {
 	}
 }
 
+func TestScrapeMaxPagesLimitsLiveTestScope(t *testing.T) {
+	var listCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/en/drugs-list":
+			listCalls.Add(1)
+			if request.URL.Query().Get("page") != "0" {
+				http.Error(writer, "unexpected page request", http.StatusBadRequest)
+				return
+			}
+			row := `<tr><td>Example ingredient</td><td>Example drug</td><td>10</td><td>Tablet</td><td>5.00</td><td><a href="/en/details_data?nid=1&id=123&page=0">Details</a></td></tr>`
+			fmt.Fprint(writer, listHTML(459, row))
+		case "/en/details_data":
+			commands := []map[string]string{{
+				"command": "openBootstrap4Dialog",
+				"data":    `<table><tr><th>Register Number</th><td>123</td></tr><tr><th>Manufacturers</th><td>Name: Example Labs | Country: Saudi Arabia</td></tr></table>`,
+			}}
+			writer.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(writer).Encode(commands)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	scraper, err := NewScraper(Options{
+		BaseURL:         server.URL,
+		MaxPages:        1,
+		RequestInterval: time.Nanosecond,
+		Backoff:         time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := scraper.FetchAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].RegistrationNumber != "123" {
+		t.Fatalf("got records %#v, want one record with registration number 123", records)
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("list page requests = %d, want 1", got)
+	}
+}
+
+func TestNewScraperRejectsNegativeMaxPages(t *testing.T) {
+	_, err := NewScraper(Options{MaxPages: -1})
+	if err == nil {
+		t.Fatal("expected negative MaxPages to be rejected")
+	}
+}
+
 func listHTML(lastPage int, row string) string {
 	return fmt.Sprintf(`<html>
 <script data-drupal-selector="drupal-settings-json">{"ajaxPageState":{"libraries":"test-state"}}</script>

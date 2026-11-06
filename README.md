@@ -58,7 +58,29 @@ func main() {
 
 `FetchAll` returns records in the same order as the website's pages. It keeps
 all returned records in memory; use `Scrape` with a sink for page-by-page
-processing.
+processing. Set `Options.MaxPages` to a positive number to limit a run; the
+default (`0`) processes all pages.
+
+## Try it with a small live test
+
+The repository includes a small example application that uses the package,
+fetches only the first page, checks that records were returned, and saves them
+to `sfda_smoke_test.xlsx`. It makes real requests to the public SFDA site but
+does not crawl the full registry:
+
+```powershell
+cd examples\smoke-test
+go run .
+```
+
+The example's `go.mod` uses a local replacement for the parent repository so
+you can test your current checkout before publishing a release. The standard
+unit tests use a local HTTP server and do not contact SFDA:
+
+```powershell
+cd ..\..
+go test ./...
+```
 
 ## Filter records
 
