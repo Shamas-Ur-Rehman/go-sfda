@@ -4,13 +4,16 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +31,9 @@ const (
 	defaultRequestTimeout = 30 * time.Second
 	defaultMaxRetries     = 4
 	defaultBackoff        = time.Second
+	defaultMaxBackoff     = 30 * time.Second
+	defaultRetryJitter    = 0.2
+	maxResponseBytes      = 8 << 20
 )
 
 // Options controls network behavior. Set HTTPClient and BaseURL to use custom
@@ -42,6 +48,10 @@ type Options struct {
 	RequestTimeout  time.Duration
 	MaxRetries      int
 	Backoff         time.Duration
+	MaxBackoff      time.Duration
+	RetryJitter     float64
+	CheckpointStore storage.CheckpointStore
+	CheckpointPath  string
 }
 
 // Scraper fetches the public SFDA list and the detail pages used by its frontend.
@@ -54,7 +64,11 @@ type Scraper struct {
 	requestInterval time.Duration
 	maxRetries      int
 	backoff         time.Duration
-	requestSlots    chan struct{}
+	maxBackoff      time.Duration
+	retryJitter     float64
+	checkpointStore storage.CheckpointStore
+	requestMu       sync.Mutex
+	lastRequest     time.Time
 }
 
 // NewScraper creates a scraper with conservative concurrency and request pacing.
@@ -83,6 +97,15 @@ func NewScraper(options Options) (*Scraper, error) {
 	if options.MaxPages < 0 {
 		return nil, fmt.Errorf("maximum pages cannot be negative")
 	}
+	if options.CheckpointStore != nil && options.CheckpointPath != "" {
+		return nil, fmt.Errorf("set either CheckpointStore or CheckpointPath, not both")
+	}
+	if options.RetryJitter < 0 || options.RetryJitter > 1 {
+		return nil, fmt.Errorf("retry jitter must be between 0 and 1")
+	}
+	if options.MaxBackoff < 0 {
+		return nil, fmt.Errorf("maximum backoff cannot be negative")
+	}
 	requestInterval := options.RequestInterval
 	if requestInterval < 0 {
 		return nil, fmt.Errorf("request interval cannot be negative")
@@ -105,9 +128,33 @@ func NewScraper(options Options) (*Scraper, error) {
 	if backoff == 0 {
 		backoff = defaultBackoff
 	}
+	maxBackoff := options.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = defaultMaxBackoff
+	}
+	if maxBackoff < backoff {
+		maxBackoff = backoff
+	}
+	retryJitter := options.RetryJitter
+	if retryJitter == 0 {
+		retryJitter = defaultRetryJitter
+	}
 	client := options.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: timeout}
+	} else {
+		clientCopy := *client
+		if clientCopy.Timeout <= 0 {
+			clientCopy.Timeout = timeout
+		}
+		client = &clientCopy
+	}
+	checkpointStore := options.CheckpointStore
+	if options.CheckpointPath != "" {
+		checkpointStore, err = storage.NewJSONCheckpointStore(options.CheckpointPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &Scraper{
@@ -119,7 +166,9 @@ func NewScraper(options Options) (*Scraper, error) {
 		requestInterval: requestInterval,
 		maxRetries:      retries,
 		backoff:         backoff,
-		requestSlots:    make(chan struct{}, 1),
+		maxBackoff:      maxBackoff,
+		retryJitter:     retryJitter,
+		checkpointStore: checkpointStore,
 	}, nil
 }
 
@@ -148,6 +197,27 @@ func (s *Scraper) Scrape(ctx context.Context, sink storage.Sink, filters ...mode
 	if _, err := model.FilterDrugs(nil, filters...); err != nil {
 		return err
 	}
+	checkpoint := storage.NewCheckpoint()
+	if s.checkpointStore != nil {
+		var err error
+		checkpoint, err = s.checkpointStore.Load()
+		if err != nil {
+			return fmt.Errorf("load scrape checkpoint: %w", err)
+		}
+		fingerprint, err := scrapeFingerprint(s.baseURL.String(), s.listPath, s.maxPages, filters)
+		if err != nil {
+			return fmt.Errorf("create scrape checkpoint fingerprint: %w", err)
+		}
+		if checkpoint.QueryFingerprint != "" && checkpoint.QueryFingerprint != fingerprint {
+			return fmt.Errorf("checkpoint belongs to a different scrape configuration; use a separate checkpoint path or remove the old checkpoint")
+		}
+		if checkpoint.QueryFingerprint == "" {
+			if checkpoint.LastCompletedPage >= 0 || checkpoint.InProgressPage != nil || len(checkpoint.FailedPages) > 0 {
+				return fmt.Errorf("checkpoint has progress but no configuration fingerprint; remove it and start a new scrape")
+			}
+			checkpoint.QueryFingerprint = fingerprint
+		}
+	}
 	firstPage, err := s.fetchListPage(ctx, 0)
 	if err != nil {
 		return fmt.Errorf("fetch SFDA list page 0: %w", err)
@@ -161,40 +231,117 @@ func (s *Scraper) Scrape(ctx context.Context, sink storage.Sink, filters ...mode
 		totalPages = s.maxPages
 	}
 
-	for page := 0; page < totalPages; page++ {
+	startPage := checkpoint.LastCompletedPage + 1
+	if startPage < 0 {
+		startPage = 0
+	}
+	for page := startPage; page < totalPages; page++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return s.failCheckpointPage(checkpoint, page, err)
+		}
+		if s.checkpointStore != nil {
+			checkpoint.InProgressPage = intPointer(page)
+			if err := s.checkpointStore.Save(checkpoint); err != nil {
+				return fmt.Errorf("save checkpoint before page %d: %w", page, err)
+			}
 		}
 		pageData := list
 		if page != 0 {
 			pageBody, fetchErr := s.fetchListPage(ctx, page)
 			if fetchErr != nil {
-				return fmt.Errorf("fetch SFDA list page %d: %w", page, fetchErr)
+				return s.failCheckpointPage(checkpoint, page, fmt.Errorf("fetch SFDA list page %d: %w", page, fetchErr))
 			}
 			pageData, err = parseListPage(pageBody, page)
 			if err != nil {
-				return fmt.Errorf("parse SFDA list page %d: %w", page, err)
+				return s.failCheckpointPage(checkpoint, page, fmt.Errorf("parse SFDA list page %d: %w", page, err))
 			}
 		}
 
 		drugs, fetchErr := s.fetchPageDetails(ctx, pageData)
 		if fetchErr != nil {
-			return fmt.Errorf("fetch drug details on SFDA list page %d: %w", page, fetchErr)
+			return s.failCheckpointPage(checkpoint, page, fmt.Errorf("fetch drug details on SFDA list page %d: %w", page, fetchErr))
 		}
 		filtered, filterErr := model.FilterDrugs(drugs, filters...)
 		if filterErr != nil {
-			return filterErr
+			return s.failCheckpointPage(checkpoint, page, filterErr)
 		}
 		for _, drug := range filtered {
 			if err := ctx.Err(); err != nil {
-				return err
+				return s.failCheckpointPage(checkpoint, page, err)
 			}
 			if err := sink.Store(ctx, drug); err != nil {
-				return fmt.Errorf("store drug %q: %w", drug.RegistrationNumber, err)
+				return s.failCheckpointPage(checkpoint, page, fmt.Errorf("store drug %q: %w", drug.RegistrationNumber, err))
+			}
+		}
+		if flusher, ok := sink.(storage.Flusher); ok {
+			if err := flusher.Flush(ctx); err != nil {
+				return s.failCheckpointPage(checkpoint, page, fmt.Errorf("flush storage after SFDA list page %d: %w", page, err))
+			}
+		}
+		if s.checkpointStore != nil {
+			checkpoint.LastCompletedPage = page
+			checkpoint.InProgressPage = nil
+			checkpoint.FailedPages = removePage(checkpoint.FailedPages, page)
+			if err := s.checkpointStore.Save(checkpoint); err != nil {
+				return fmt.Errorf("save checkpoint after page %d: %w", page, err)
 			}
 		}
 	}
 	return nil
+}
+
+func (s *Scraper) failCheckpointPage(checkpoint storage.Checkpoint, page int, cause error) error {
+	if s.checkpointStore == nil {
+		return cause
+	}
+	checkpoint.InProgressPage = intPointer(page)
+	checkpoint.FailedPages = addPage(checkpoint.FailedPages, page)
+	if err := s.checkpointStore.Save(checkpoint); err != nil {
+		return errors.Join(cause, fmt.Errorf("save failed-page checkpoint %d: %w", page, err))
+	}
+	return cause
+}
+
+func intPointer(value int) *int {
+	return &value
+}
+
+func scrapeFingerprint(baseURL, listPath string, maxPages int, filters []model.Filter) (string, error) {
+	configuration := struct {
+		BaseURL  string
+		ListPath string
+		MaxPages int
+		Filters  []model.Filter
+	}{
+		BaseURL:  baseURL,
+		ListPath: listPath,
+		MaxPages: maxPages,
+		Filters:  filters,
+	}
+	encoded, err := json.Marshal(configuration)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(encoded)), nil
+}
+
+func addPage(pages []int, page int) []int {
+	for _, existing := range pages {
+		if existing == page {
+			return pages
+		}
+	}
+	return append(pages, page)
+}
+
+func removePage(pages []int, page int) []int {
+	result := pages[:0]
+	for _, existing := range pages {
+		if existing != page {
+			result = append(result, existing)
+		}
+	}
+	return result
 }
 
 type detailResult struct {
@@ -204,27 +351,59 @@ type detailResult struct {
 
 func (s *Scraper) fetchPageDetails(ctx context.Context, page listPage) ([]model.Drug, error) {
 	results := make([]detailResult, len(page.Drugs))
-	semaphore := make(chan struct{}, s.maxWorkers)
-	var waitGroup sync.WaitGroup
-	for i, summary := range page.Drugs {
-		waitGroup.Add(1)
-		go func(index int, item drugSummary) {
-			defer waitGroup.Done()
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-ctx.Done():
-				results[index].err = ctx.Err()
-				return
-			}
-			details, err := s.fetchDetails(ctx, item.DetailURL, page.AjaxLibraries)
-			if err != nil {
-				results[index].err = err
-				return
-			}
-			results[index].drug, results[index].err = mergeDrug(item.Drug, details)
-		}(i, summary)
+	type detailGroup struct {
+		detailURL string
+		indices   []int
 	}
+	groups := make([]detailGroup, 0, len(page.Drugs))
+	groupByURL := make(map[string]int, len(page.Drugs))
+	for index, summary := range page.Drugs {
+		groupIndex, ok := groupByURL[summary.DetailURL]
+		if !ok {
+			groupIndex = len(groups)
+			groupByURL[summary.DetailURL] = groupIndex
+			groups = append(groups, detailGroup{detailURL: summary.DetailURL})
+		}
+		groups[groupIndex].indices = append(groups[groupIndex].indices, index)
+	}
+	jobs := make(chan int, s.maxWorkers)
+	var waitGroup sync.WaitGroup
+	workerCount := s.maxWorkers
+	if workerCount > len(groups) {
+		workerCount = len(groups)
+	}
+	for worker := 0; worker < workerCount; worker++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			for groupIndex := range jobs {
+				group := groups[groupIndex]
+				details, err := s.fetchDetails(ctx, group.detailURL, page.AjaxLibraries)
+				for _, index := range group.indices {
+					if err != nil {
+						results[index].err = err
+						continue
+					}
+					results[index].drug, results[index].err = mergeDrug(page.Drugs[index].Drug, details)
+				}
+			}
+		}()
+	}
+	for groupIndex := range groups {
+		select {
+		case jobs <- groupIndex:
+		case <-ctx.Done():
+			for remaining := groupIndex; remaining < len(groups); remaining++ {
+				for _, index := range groups[remaining].indices {
+					results[index].err = ctx.Err()
+				}
+			}
+			close(jobs)
+			waitGroup.Wait()
+			return nil, ctx.Err()
+		}
+	}
+	close(jobs)
 	waitGroup.Wait()
 
 	drugs := make([]model.Drug, 0, len(results))
@@ -315,9 +494,6 @@ func (s *Scraper) request(
 		}
 	}
 	for attempt := 0; attempt < s.maxRetries; attempt++ {
-		if err := s.waitForRequestSlot(ctx); err != nil {
-			return nil, err
-		}
 		var requestReader io.Reader
 		if body != nil {
 			requestReader = bytes.NewReader(requestBody)
@@ -331,6 +507,9 @@ func (s *Scraper) request(
 		for key, value := range headers {
 			request.Header.Set(key, value)
 		}
+		if err := s.waitForRequestSlot(ctx); err != nil {
+			return nil, err
+		}
 
 		response, requestErr := s.httpClient.Do(request)
 		if requestErr != nil {
@@ -340,35 +519,48 @@ func (s *Scraper) request(
 			if attempt+1 == s.maxRetries {
 				return nil, fmt.Errorf("%s %s failed after %d attempts: %w", method, requestURL, s.maxRetries, requestErr)
 			}
-			if err := sleepContext(ctx, s.backoff*time.Duration(1<<attempt)); err != nil {
+			if err := sleepContext(ctx, s.retryDelay(attempt)); err != nil {
 				return nil, err
 			}
 			continue
 		}
 
-		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, 8<<20))
-		response.Body.Close()
+		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+		closeErr := response.Body.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("read %s response: %w", method, readErr)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if attempt+1 == s.maxRetries {
+				return nil, fmt.Errorf("read %s response after %d attempts: %w", method, s.maxRetries, readErr)
+			}
+			wait := s.retryDelay(attempt)
+			if retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now()); retryAfter > wait {
+				wait = retryAfter
+			}
+			if err := sleepContext(ctx, wait); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close %s response: %w", method, closeErr)
+		}
+		if len(responseBody) > maxResponseBytes {
+			return nil, fmt.Errorf("%s %s response exceeds %d bytes", method, requestURL, maxResponseBytes)
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			return responseBody, nil
 		}
-		if response.StatusCode != http.StatusTooManyRequests && response.StatusCode < 500 {
+		if !retryableStatus(response.StatusCode) {
 			return nil, fmt.Errorf("%s %s returned HTTP %d: %s", method, requestURL, response.StatusCode, strings.TrimSpace(string(responseBody)))
 		}
 		if attempt+1 == s.maxRetries {
 			return nil, fmt.Errorf("%s %s returned HTTP %d after %d attempts", method, requestURL, response.StatusCode, s.maxRetries)
 		}
-		wait := s.backoff * time.Duration(1<<attempt)
-		if response.StatusCode == http.StatusTooManyRequests {
-			if retryAfter := response.Header.Get("Retry-After"); retryAfter != "" {
-				if seconds, parseErr := time.ParseDuration(retryAfter + "s"); parseErr == nil {
-					wait = seconds
-				} else if retryAt, dateErr := http.ParseTime(retryAfter); dateErr == nil && time.Until(retryAt) > 0 {
-					wait = time.Until(retryAt)
-				}
-			}
+		wait := s.retryDelay(attempt)
+		if retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now()); retryAfter > wait {
+			wait = retryAfter
 		}
 		if err := sleepContext(ctx, wait); err != nil {
 			return nil, err
@@ -378,16 +570,70 @@ func (s *Scraper) request(
 }
 
 func (s *Scraper) waitForRequestSlot(ctx context.Context) error {
-	select {
-	case s.requestSlots <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
+	for {
+		s.requestMu.Lock()
+		wait := s.requestInterval - time.Since(s.lastRequest)
+		if s.lastRequest.IsZero() || wait <= 0 {
+			s.lastRequest = time.Now()
+			s.requestMu.Unlock()
+			return nil
+		}
+		s.requestMu.Unlock()
+		if err := sleepContext(ctx, wait); err != nil {
+			return err
+		}
 	}
-	defer func() { <-s.requestSlots }()
-	if err := sleepContext(ctx, s.requestInterval); err != nil {
-		return err
+}
+
+func (s *Scraper) retryDelay(attempt int) time.Duration {
+	delay := s.backoff
+	for i := 0; i < attempt && delay < s.maxBackoff; i++ {
+		if delay > s.maxBackoff/2 {
+			delay = s.maxBackoff
+			break
+		}
+		delay *= 2
 	}
-	return nil
+	if delay > s.maxBackoff {
+		delay = s.maxBackoff
+	}
+	if s.retryJitter > 0 {
+		factor := 1 - s.retryJitter + rand.Float64()*2*s.retryJitter
+		delay = time.Duration(float64(delay) * factor)
+	}
+	if delay > s.maxBackoff {
+		delay = s.maxBackoff
+	}
+	return delay
+}
+
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		if int64(seconds) > int64((1<<63-1)/int64(time.Second)) {
+			return time.Duration(1<<63 - 1)
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil && retryAt.After(now) {
+		return retryAt.Sub(now)
+	}
+	return 0
 }
 
 func sleepContext(ctx context.Context, duration time.Duration) error {
@@ -492,6 +738,8 @@ func mergeDrug(summary, details map[string]string) (model.Drug, error) {
 		MarketingCompany:             get("Marketing Company"),
 		MarketingCompanyCountry:      get("Country of marketing company"),
 		Agents:                       get("Agents"),
+		DrugDomain:                   firstNonEmpty(get("Drug Domain"), get("Domain")),
+		DrugType:                     get("Drug Type"),
 		DosageForm:                   firstNonEmpty(get("Dosage Form"), summary["dosage_form"]),
 		RouteOfAdministration:        get("Route of Administration"),
 		Strength:                     firstNonEmpty(get("Strength"), summary["strength"]),
@@ -504,6 +752,7 @@ func mergeDrug(summary, details map[string]string) (model.Drug, error) {
 		MarketingStatus:              get("Marketing Status"),
 		AuthorizationStatus:          get("Authorization Status"),
 		LegalStatus:                  get("Legal Status"),
+		RegistrationYear:             get("Registration Year"),
 		ProductControl:               get("Product Control"),
 		DistributionSite:             get("Distribution Site"),
 		StorageConditions:            get("Storage Conditions"),

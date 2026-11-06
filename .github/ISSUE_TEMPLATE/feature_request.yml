@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a focused improvement to the Go client.
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest change that would solve the use case.
+    validations:
+      required: true
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Responsible usage
+      options:
+        - label: This proposal does not require bypassing SFDA access controls or rate limits.
+          required: true

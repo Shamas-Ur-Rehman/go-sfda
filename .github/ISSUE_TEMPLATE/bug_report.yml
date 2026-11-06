@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible defect in the Go client.
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Include the observed error and expected behavior. Redact personal or sensitive data.
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      placeholder: go version go1.23.0 windows/amd64
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest code or command that reproduces the issue. Do not include secrets.
+      render: go
+    validations:
+      required: true
+  - type: checkboxes
+    id: live-site
+    attributes:
+      label: SFDA site behavior
+      options:
+        - label: I confirmed this is reproducible with a local test where practical, and did not run an uncontrolled full scrape.

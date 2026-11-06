@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -22,13 +23,14 @@ type listPage struct {
 }
 
 func parseListPage(body []byte, currentPage int) (listPage, error) {
-	root, err := html.Parse(strings.NewReader(string(body)))
+	root, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
 		return listPage{}, fmt.Errorf("parse list page: %w", err)
 	}
 
 	result := listPage{TotalPages: currentPage + 1}
 	var listTable *html.Node
+	var settingsParseErr error
 	var visit func(*html.Node)
 	visit = func(node *html.Node) {
 		if node.Type == html.ElementNode && node.Data == "table" && hasClass(node, "responsive-enabled") && listTable == nil {
@@ -45,6 +47,8 @@ func parseListPage(body []byte, currentPage int) (listPage, error) {
 			settings, settingsErr := parseDrupalSettings(textContent(node))
 			if settingsErr == nil {
 				result.AjaxLibraries = settings.AjaxPageState.Libraries
+			} else {
+				settingsParseErr = settingsErr
 			}
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
@@ -56,6 +60,9 @@ func parseListPage(body []byte, currentPage int) (listPage, error) {
 	if listTable == nil {
 		if strings.Contains(strings.ToLower(textContent(root)), "no results found") {
 			if result.AjaxLibraries == "" {
+				if settingsParseErr != nil {
+					return listPage{}, fmt.Errorf("SFDA empty-results page has invalid Drupal AJAX state: %w", settingsParseErr)
+				}
 				return listPage{}, fmt.Errorf("SFDA empty-results page is missing Drupal AJAX state")
 			}
 			return result, nil
@@ -112,6 +119,9 @@ func parseListPage(body []byte, currentPage int) (listPage, error) {
 		return listPage{}, fmt.Errorf("SFDA drugs table contained no rows with details links")
 	}
 	if result.AjaxLibraries == "" {
+		if settingsParseErr != nil {
+			return listPage{}, fmt.Errorf("SFDA page has invalid Drupal AJAX state: %w", settingsParseErr)
+		}
 		return listPage{}, fmt.Errorf("SFDA page did not include Drupal AJAX library state")
 	}
 	return result, nil

@@ -4,6 +4,7 @@ package view
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/Shamas-Ur-Rehman/go-sfda/model"
 	"github.com/xuri/excelize/v2"
@@ -44,11 +45,33 @@ var columns = []struct {
 	{"Company Country", func(d model.Drug) string { return d.MarketingCompanyCountry }},
 	{"Additional Manufacturer", func(d model.Drug) string { return d.AdditionalManufacturers }},
 	{"Additional Manufacturer Country", func(d model.Drug) string { return d.AdditionalManufacturerPlaces }},
+	{"Description Code", func(d model.Drug) string { return d.DescriptionCode }},
 }
 
 // WriteExcel writes drug records to an XLSX workbook. Pass an os.File to create
 // a file or an http.ResponseWriter to serve a browser download.
 func WriteExcel(writer io.Writer, drugs []model.Drug) error {
+	index := 0
+	return WriteExcelFrom(writer, func() (model.Drug, bool, error) {
+		if index == len(drugs) {
+			return model.Drug{}, false, nil
+		}
+		drug := drugs[index]
+		index++
+		return drug, true, nil
+	})
+}
+
+// WriteExcelFrom writes records from next using Excelize's streaming writer,
+// which avoids retaining the full data sheet in memory. next returns one row,
+// false when finished, or an error that aborts the export.
+func WriteExcelFrom(writer io.Writer, next func() (model.Drug, bool, error)) error {
+	if writer == nil {
+		return fmt.Errorf("Excel output writer cannot be nil")
+	}
+	if next == nil {
+		return fmt.Errorf("Excel row source cannot be nil")
+	}
 	file := excelize.NewFile()
 	defer file.Close()
 
@@ -56,27 +79,15 @@ func WriteExcel(writer io.Writer, drugs []model.Drug) error {
 	if err := file.SetSheetName("Sheet1", sheet); err != nil {
 		return fmt.Errorf("rename Excel sheet: %w", err)
 	}
-	for columnIndex, column := range columns {
-		cell, err := excelize.CoordinatesToCellName(columnIndex+1, 1)
-		if err != nil {
-			return fmt.Errorf("create Excel header cell: %w", err)
-		}
-		if err := file.SetCellValue(sheet, cell, column.header); err != nil {
-			return fmt.Errorf("write Excel header: %w", err)
-		}
+	if _, err := file.NewSheet("Metadata"); err != nil {
+		return fmt.Errorf("create Excel metadata sheet: %w", err)
 	}
-	for rowIndex, drug := range drugs {
-		for columnIndex, column := range columns {
-			cell, err := excelize.CoordinatesToCellName(columnIndex+1, rowIndex+2)
-			if err != nil {
-				return fmt.Errorf("create Excel data cell: %w", err)
-			}
-			if err := file.SetCellValue(sheet, cell, column.value(drug)); err != nil {
-				return fmt.Errorf("write Excel data: %w", err)
-			}
-		}
+	if err := file.SetCellValue("Metadata", "A1", "Exported At (UTC)"); err != nil {
+		return fmt.Errorf("write Excel export metadata label: %w", err)
 	}
-
+	if err := file.SetCellValue("Metadata", "B1", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return fmt.Errorf("write Excel export timestamp: %w", err)
+	}
 	headerStyle, err := file.NewStyle(&excelize.Style{
 		Font:      &excelize.Font{Bold: true, Color: "FFFFFF"},
 		Fill:      excelize.Fill{Type: "pattern", Color: []string{"1F4E79"}, Pattern: 1},
@@ -85,18 +96,41 @@ func WriteExcel(writer io.Writer, drugs []model.Drug) error {
 	if err != nil {
 		return fmt.Errorf("create Excel header style: %w", err)
 	}
-	lastHeader, err := excelize.CoordinatesToCellName(len(columns), 1)
+	streamWriter, err := file.NewStreamWriter(sheet)
 	if err != nil {
-		return fmt.Errorf("create Excel header range: %w", err)
+		return fmt.Errorf("create Excel streaming writer: %w", err)
 	}
-	if err := file.SetCellStyle(sheet, "A1", lastHeader, headerStyle); err != nil {
-		return fmt.Errorf("style Excel headers: %w", err)
+	if err := streamWriter.SetRow("A1", columnValues(model.Drug{}, true), excelize.RowOpts{StyleID: headerStyle}); err != nil {
+		return fmt.Errorf("write Excel headers: %w", err)
 	}
+
+	rowIndex := 2
+	for {
+		drug, ok, err := next()
+		if err != nil {
+			return fmt.Errorf("read next drug for Excel: %w", err)
+		}
+		if !ok {
+			break
+		}
+		cell, err := excelize.CoordinatesToCellName(1, rowIndex)
+		if err != nil {
+			return fmt.Errorf("create Excel row reference: %w", err)
+		}
+		if err := streamWriter.SetRow(cell, columnValues(drug, false)); err != nil {
+			return fmt.Errorf("write Excel row %d: %w", rowIndex, err)
+		}
+		rowIndex++
+	}
+	if err := streamWriter.Flush(); err != nil {
+		return fmt.Errorf("flush Excel rows: %w", err)
+	}
+
 	lastColumn, err := excelize.ColumnNumberToName(len(columns))
 	if err != nil {
 		return fmt.Errorf("create Excel filter range: %w", err)
 	}
-	if err := file.AutoFilter(sheet, fmt.Sprintf("A1:%s%d", lastColumn, len(drugs)+1), []excelize.AutoFilterOptions{}); err != nil {
+	if err := file.AutoFilter(sheet, fmt.Sprintf("A1:%s%d", lastColumn, rowIndex-1), []excelize.AutoFilterOptions{}); err != nil {
 		return fmt.Errorf("set Excel autofilter: %w", err)
 	}
 	if err := file.SetPanes(sheet, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"}); err != nil {
@@ -106,4 +140,16 @@ func WriteExcel(writer io.Writer, drugs []model.Drug) error {
 		return fmt.Errorf("write Excel workbook: %w", err)
 	}
 	return nil
+}
+
+func columnValues(drug model.Drug, header bool) []interface{} {
+	values := make([]interface{}, len(columns))
+	for columnIndex, column := range columns {
+		if header {
+			values[columnIndex] = column.header
+		} else {
+			values[columnIndex] = column.value(drug)
+		}
+	}
+	return values
 }

@@ -3,13 +3,20 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Shamas-Ur-Rehman/go-sfda/model"
+	"github.com/Shamas-Ur-Rehman/go-sfda/storage"
 )
 
 func TestScrapeUsesFrontendAJAXAndContinuesAcrossEmptyPage(t *testing.T) {
@@ -107,6 +114,24 @@ func TestParseListPageRejectsUnexpectedHTML(t *testing.T) {
 	}
 }
 
+func TestParseListPageReportsMalformedDrupalState(t *testing.T) {
+	body := []byte(`<html><script data-drupal-selector="drupal-settings-json">{bad json}</script><table class="responsive-enabled"><tbody><tr><td>Ingredient</td><td>Drug</td><td>10</td><td>Tablet</td><td>5.00</td><td><a href="/en/details_data?id=1">Details</a></td></tr></tbody></table></html>`)
+	_, err := parseListPage(body, 0)
+	if err == nil || !strings.Contains(err.Error(), "invalid Drupal AJAX state") {
+		t.Fatalf("expected a descriptive Drupal state error, got %v", err)
+	}
+}
+
+func TestParseDetailTablePreservesArabicText(t *testing.T) {
+	fields, err := parseDetailTable(`<table><tr><th>Trade Name</th><td>دواء تجريبي</td></tr></table>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fields["Trade Name"]; got != "دواء تجريبي" {
+		t.Fatalf("Arabic trade name = %q", got)
+	}
+}
+
 func TestScrapeMaxPagesLimitsLiveTestScope(t *testing.T) {
 	var listCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -157,6 +182,419 @@ func TestNewScraperRejectsNegativeMaxPages(t *testing.T) {
 	_, err := NewScraper(Options{MaxPages: -1})
 	if err == nil {
 		t.Fatal("expected negative MaxPages to be rejected")
+	}
+}
+
+func TestRequestRetriesTransientStatusesAndHonorsRetryAfter(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			http.Error(writer, "temporary", http.StatusServiceUnavailable)
+		case 2:
+			writer.Header().Set("Retry-After", "0")
+			http.Error(writer, "rate limited", http.StatusTooManyRequests)
+		default:
+			_, _ = writer.Write([]byte("ok"))
+		}
+	}))
+	defer server.Close()
+
+	scraper, err := NewScraper(Options{
+		BaseURL:         server.URL,
+		RequestInterval: time.Nanosecond,
+		Backoff:         time.Millisecond,
+		MaxBackoff:      time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := scraper.request(context.Background(), http.MethodGet, server.URL, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ok" || calls.Load() != 3 {
+		t.Fatalf("body=%q calls=%d, want ok and 3 calls", body, calls.Load())
+	}
+}
+
+func TestRequestRetriesSupportedServerStatuses(t *testing.T) {
+	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				if calls.Add(1) == 1 {
+					http.Error(writer, "retry", status)
+					return
+				}
+				_, _ = writer.Write([]byte("ok"))
+			}))
+			defer server.Close()
+			scraper, err := NewScraper(Options{
+				BaseURL:         server.URL,
+				RequestInterval: time.Nanosecond,
+				Backoff:         time.Nanosecond,
+				MaxBackoff:      time.Nanosecond,
+				MaxRetries:      2,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := scraper.request(context.Background(), http.MethodGet, server.URL, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if calls.Load() != 2 {
+				t.Fatalf("requests = %d, want 2", calls.Load())
+			}
+		})
+	}
+}
+
+func TestRetryAfterParsesDelayAndHTTPDate(t *testing.T) {
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	if got := parseRetryAfter("3", now); got != 3*time.Second {
+		t.Fatalf("delta Retry-After = %s, want 3s", got)
+	}
+	if got := parseRetryAfter(now.Add(5*time.Second).Format(http.TimeFormat), now); got != 5*time.Second {
+		t.Fatalf("date Retry-After = %s, want 5s", got)
+	}
+	if got := parseRetryAfter("invalid", now); got != 0 {
+		t.Fatalf("invalid Retry-After = %s, want 0", got)
+	}
+}
+
+func TestConfiguredTimeoutAppliesToCustomHTTPClientWithoutTimeout(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		close(started)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	scraper, err := NewScraper(Options{
+		BaseURL:         server.URL,
+		HTTPClient:      server.Client(),
+		RequestTimeout:  25 * time.Millisecond,
+		RequestInterval: time.Nanosecond,
+		MaxRetries:      1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = scraper.request(context.Background(), http.MethodGet, server.URL, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("expected request timeout, got %v", err)
+	}
+	<-started
+}
+
+func TestRequestDoesNotRetryNonRetryableStatus(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(writer, "not found", http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	scraper, err := NewScraper(Options{BaseURL: server.URL, RequestInterval: time.Nanosecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = scraper.request(context.Background(), http.MethodGet, server.URL, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") || calls.Load() != 1 {
+		t.Fatalf("error=%v calls=%d, want one non-retried 404", err, calls.Load())
+	}
+}
+
+func TestRequestIntervalPacesConcurrentRequestStarts(t *testing.T) {
+	var mu sync.Mutex
+	var starts []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		starts = append(starts, time.Now())
+		mu.Unlock()
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	scraper, err := NewScraper(Options{
+		BaseURL:         server.URL,
+		RequestInterval: 100 * time.Millisecond,
+		MaxRetries:      1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorsFound := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, requestErr := scraper.request(context.Background(), http.MethodGet, server.URL, nil, nil)
+			errorsFound <- requestErr
+		}()
+	}
+	for range 2 {
+		if err := <-errorsFound; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(starts) != 2 {
+		t.Fatalf("request start count = %d, want 2", len(starts))
+	}
+	if interval := starts[1].Sub(starts[0]); interval < 80*time.Millisecond {
+		t.Fatalf("request starts were only %s apart, want at least 80ms", interval)
+	}
+}
+
+func TestScrapeFetchesDuplicateDetailURLOnce(t *testing.T) {
+	var detailCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/en/drugs-list":
+			row := `<tr><td>Ingredient</td><td>Drug</td><td>10</td><td>Tablet</td><td>5.00</td><td><a href="/en/details_data?nid=1&id=100&page=0">Details</a></td></tr>`
+			fmt.Fprint(writer, listHTML(0, row+row))
+		case "/en/details_data":
+			detailCalls.Add(1)
+			commands := []map[string]string{{
+				"command": "openBootstrap4Dialog",
+				"data":    `<table><tr><th>Register Number</th><td>100</td></tr><tr><th>Manufacturers</th><td>Name: Example Labs | Country: Saudi Arabia</td></tr></table>`,
+			}}
+			writer.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(writer).Encode(commands)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	scraper, err := NewScraper(Options{BaseURL: server.URL, RequestInterval: time.Nanosecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := scraper.FetchAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || detailCalls.Load() != 1 {
+		t.Fatalf("records=%d detail calls=%d, want 2 records from one request", len(records), detailCalls.Load())
+	}
+}
+
+func TestRequestContextCancellation(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		close(started)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	scraper, err := NewScraper(Options{BaseURL: server.URL, RequestInterval: time.Nanosecond, MaxRetries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, requestErr := scraper.request(ctx, http.MethodGet, server.URL, nil, nil)
+		result <- requestErr
+	}()
+	<-started
+	cancel()
+	if err := <-result; err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("expected cancellation error, got %v", err)
+	}
+}
+
+func TestScrapeCheckpointResumesAfterLastCommittedPage(t *testing.T) {
+	var detailsByID sync.Map
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/en/drugs-list":
+			page := request.URL.Query().Get("page")
+			id := map[string]string{"0": "100", "1": "101", "2": "102"}[page]
+			if id == "" {
+				http.NotFound(writer, request)
+				return
+			}
+			row := fmt.Sprintf(`<tr><td>Ingredient</td><td>Drug %s</td><td>10</td><td>Tablet</td><td>5.00</td><td><a href="/en/details_data?nid=1&id=%s&page=%s">Details</a></td></tr>`, id, id, page)
+			fmt.Fprint(writer, listHTML(2, row))
+		case "/en/details_data":
+			id := request.URL.Query().Get("id")
+			current, _ := detailsByID.LoadOrStore(id, &atomic.Int32{})
+			current.(*atomic.Int32).Add(1)
+			commands := []map[string]string{{
+				"command": "openBootstrap4Dialog",
+				"data":    fmt.Sprintf(`<table><tr><th>Register Number</th><td>%s</td></tr><tr><th>Trade Name</th><td>Drug %s</td></tr><tr><th>Manufacturers</th><td>Name: Example Labs | Country: Saudi Arabia</td></tr></table>`, id, id),
+			}}
+			writer.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(writer).Encode(commands)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	checkpointPath := filepath.Join(t.TempDir(), "resume.json")
+	scraper, err := NewScraper(Options{
+		BaseURL:         server.URL,
+		RequestInterval: time.Nanosecond,
+		Backoff:         time.Nanosecond,
+		CheckpointPath:  checkpointPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeErr := fmt.Errorf("simulated storage failure")
+	err = scraper.Scrape(context.Background(), storage.SinkFunc(func(_ context.Context, drug model.Drug) error {
+		if drug.RegistrationNumber == "101" {
+			return storeErr
+		}
+		return nil
+	}))
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("expected storage failure, got %v", err)
+	}
+	checkpointStore, err := storage.NewJSONCheckpointStore(checkpointPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := checkpointStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.LastCompletedPage != 0 || checkpoint.InProgressPage == nil ||
+		*checkpoint.InProgressPage != 1 || !reflect.DeepEqual(checkpoint.FailedPages, []int{1}) {
+		t.Fatalf("unexpected failed checkpoint: %+v", checkpoint)
+	}
+
+	var stored []model.Drug
+	if err := scraper.Scrape(context.Background(), storage.SinkFunc(func(_ context.Context, drug model.Drug) error {
+		stored = append(stored, drug)
+		return nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 || stored[0].RegistrationNumber != "101" || stored[1].RegistrationNumber != "102" {
+		t.Fatalf("unexpected resumed records: %#v", stored)
+	}
+	for id, expected := range map[string]int32{"100": 1, "101": 2, "102": 1} {
+		count, ok := detailsByID.Load(id)
+		if !ok || count.(*atomic.Int32).Load() != expected {
+			t.Fatalf("details calls for %s = %v, want %d", id, count, expected)
+		}
+	}
+	checkpoint, err = checkpointStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.LastCompletedPage != 2 || checkpoint.InProgressPage != nil || len(checkpoint.FailedPages) != 0 {
+		t.Fatalf("unexpected completed checkpoint: %+v", checkpoint)
+	}
+}
+
+func TestScrapeCheckpointRejectsDifferentFilters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/en/drugs-list":
+			row := `<tr><td>Ingredient</td><td>Drug</td><td>10</td><td>Tablet</td><td>5.00</td><td><a href="/en/details_data?nid=1&id=100&page=0">Details</a></td></tr>`
+			fmt.Fprint(writer, listHTML(0, row))
+		case "/en/details_data":
+			commands := []map[string]string{{
+				"command": "openBootstrap4Dialog",
+				"data":    `<table><tr><th>Register Number</th><td>100</td></tr><tr><th>Manufacturers</th><td>Name: Example Labs | Country: Saudi Arabia</td></tr></table>`,
+			}}
+			writer.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(writer).Encode(commands)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	checkpointPath := filepath.Join(t.TempDir(), "resume.json")
+	scraper, err := NewScraper(Options{
+		BaseURL:         server.URL,
+		RequestInterval: time.Nanosecond,
+		CheckpointPath:  checkpointPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scraper.Scrape(context.Background(), storage.SinkFunc(func(context.Context, model.Drug) error { return nil })); err != nil {
+		t.Fatal(err)
+	}
+	err = scraper.Scrape(context.Background(), storage.SinkFunc(func(context.Context, model.Drug) error { return nil }),
+		model.Filter{Field: "TradeName", Value: "other"})
+	if err == nil || !strings.Contains(err.Error(), "different scrape configuration") {
+		t.Fatalf("expected configuration mismatch, got %v", err)
+	}
+}
+
+type failOnceFlushSink struct {
+	flushes int
+}
+
+func (s *failOnceFlushSink) Store(context.Context, model.Drug) error { return nil }
+
+func (s *failOnceFlushSink) Flush(context.Context) error {
+	s.flushes++
+	if s.flushes == 1 {
+		return fmt.Errorf("simulated batch flush failure")
+	}
+	return nil
+}
+
+func TestCheckpointDoesNotCommitPageUntilSinkFlushSucceeds(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/en/drugs-list":
+			row := `<tr><td>Ingredient</td><td>Drug</td><td>10</td><td>Tablet</td><td>5.00</td><td><a href="/en/details_data?nid=1&id=100&page=0">Details</a></td></tr>`
+			fmt.Fprint(writer, listHTML(0, row))
+		case "/en/details_data":
+			commands := []map[string]string{{
+				"command": "openBootstrap4Dialog",
+				"data":    `<table><tr><th>Register Number</th><td>100</td></tr><tr><th>Manufacturers</th><td>Name: Example Labs | Country: Saudi Arabia</td></tr></table>`,
+			}}
+			writer.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(writer).Encode(commands)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	checkpointPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	scraper, err := NewScraper(Options{
+		BaseURL:         server.URL,
+		RequestInterval: time.Nanosecond,
+		CheckpointPath:  checkpointPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &failOnceFlushSink{}
+	if err := scraper.Scrape(context.Background(), sink); err == nil {
+		t.Fatal("expected the first flush to fail")
+	}
+	checkpointStore, err := storage.NewJSONCheckpointStore(checkpointPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := checkpointStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.LastCompletedPage != -1 || checkpoint.InProgressPage == nil || *checkpoint.InProgressPage != 0 {
+		t.Fatalf("failed flush incorrectly committed page: %+v", checkpoint)
+	}
+	if err := scraper.Scrape(context.Background(), sink); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err = checkpointStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.LastCompletedPage != 0 || checkpoint.InProgressPage != nil || len(checkpoint.FailedPages) != 0 {
+		t.Fatalf("successful retry did not commit page: %+v", checkpoint)
 	}
 }
 

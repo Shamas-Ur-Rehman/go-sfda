@@ -1,0 +1,15 @@
+# Generated workbook files
+sfda_registered_drugs.xlsx
+sfda_smoke_test.xlsx
+*.xlsx
+
+# Resumable scrape state
+*.checkpoint.json
+sfda.checkpoint.json
+
+# Go build and test outputs
+*.test
+*.out
+coverage.txt
+coverage.html
+examples/smoke-test/go-sfda-smoke-test*

@@ -1,0 +1,56 @@
+name: Go CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          files=$(find . -type f -name '*.go' -not -path './.git/*')
+          unformatted=$(gofmt -l $files)
+          if [ -n "$unformatted" ]; then
+            echo "Go files need formatting:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
+
+      - name: Build library
+        run: go build ./...
+
+      - name: Build smoke-test consumer
+        working-directory: examples/smoke-test
+        run: |
+          go test ./...
+          go build ./...
+
+      - name: Build database adapters
+        working-directory: examples/database-adapters
+        run: |
+          go test ./...
+          go build ./...
