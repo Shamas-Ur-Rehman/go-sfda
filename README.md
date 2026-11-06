@@ -24,7 +24,7 @@ implementing a small sink interface.
 ## Install
 
 ```sh
-go get github.com/SandiRidwan/sfda-drug-registry-scraper/go-sfda
+go get github.com/Shamas-Ur-Rehman/go-sfda
 ```
 
 The repository currently keeps the Go module in the `go-sfda/` subdirectory.
@@ -41,7 +41,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/SandiRidwan/sfda-drug-registry-scraper/go-sfda/controller"
+	"github.com/Shamas-Ur-Rehman/go-sfda/controller"
 )
 
 func main() {
@@ -69,7 +69,7 @@ processing.
 Filters are case-insensitive and use AND semantics:
 
 ```go
-import "github.com/SandiRidwan/sfda-drug-registry-scraper/go-sfda/model"
+import "github.com/Shamas-Ur-Rehman/go-sfda/model"
 
 drugs, err := client.FetchAll(
 	context.Background(),
@@ -101,8 +101,8 @@ import (
 	"log"
 	"os"
 
-	"github.com/SandiRidwan/sfda-drug-registry-scraper/go-sfda/controller"
-	"github.com/SandiRidwan/sfda-drug-registry-scraper/go-sfda/view"
+	"github.com/Shamas-Ur-Rehman/go-sfda/controller"
+	"github.com/Shamas-Ur-Rehman/go-sfda/view"
 )
 
 func main() {
